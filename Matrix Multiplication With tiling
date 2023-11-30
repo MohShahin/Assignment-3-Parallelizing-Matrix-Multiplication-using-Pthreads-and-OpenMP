@@ -1,0 +1,129 @@
+%%cu
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+
+const int TILE_SIZE = 32;
+
+//=========================================================================================================== Tiled matrix multiplication kernel
+__global__ void MatrixMulTiledKernel(float* M, float* N, float* P, int WidthM, int HeightM, int WidthN, int HeightN) {
+  int Row = blockIdx.y * blockDim.y + threadIdx.y;
+  int Col = blockIdx.x * blockDim.x + threadIdx.x;
+
+  __shared__ float M_shared[TILE_SIZE][TILE_SIZE];
+  __shared__ float N_shared[TILE_SIZE][TILE_SIZE];
+
+  float Pvalue = 0;
+
+  //:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::Load tiles into shared memory
+  for (int t = 0; t < (WidthM + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+    int tileRow = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int tileCol = t * TILE_SIZE + threadIdx.x;
+
+    if (tileRow < HeightM && tileCol < WidthM) {
+      M_shared[threadIdx.y][threadIdx.x] = M[tileRow * WidthM + tileCol];
+    } else {
+      M_shared[threadIdx.y][threadIdx.x] = 0;
+    }
+
+    tileRow = t * TILE_SIZE + threadIdx.y;
+    tileCol = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    if (tileRow < HeightN && tileCol < WidthN) {
+      N_shared[threadIdx.y][threadIdx.x] = N[tileRow * WidthN + tileCol];
+    } else {
+      N_shared[threadIdx.y][threadIdx.x] = 0;
+    }
+
+    __syncthreads();
+
+    //:::::::::::::::::::::::::::::::::::::::::::::::::::Compute the tile's contribution to the Pvalue
+    for (int k = 0; k < TILE_SIZE; ++k) {
+      Pvalue += M_shared[threadIdx.y][k] * N_shared[k][threadIdx.x];
+    }
+
+    __syncthreads();
+  }
+
+  //:::::::::::::::::::::::::::::::::::::::::::Write the final result to global memory
+  if (Row < HeightM && Col < WidthN) {
+    P[Row * WidthN + Col] = Pvalue;
+  }
+}
+//--------------------------------------------------------------------------------------------
+int main() {
+  int WidthM = 2048;
+  int HeightM = 1024;
+  int WidthN = 1024;
+  int HeightN = 2048;
+
+  size_t matrixSizeM = WidthM * HeightM * sizeof(float);
+  size_t matrixSizeN = WidthN * HeightN * sizeof(float);
+  size_t matrixSizeP;
+
+  float *h_M, *h_N, *h_P;
+  h_M = (float*)malloc(matrixSizeM);
+  h_N = (float*)malloc(matrixSizeN);
+  h_P = nullptr;
+
+  float *d_M, *d_N, *d_P;
+  cudaMalloc((void**)&d_M, matrixSizeM);
+  cudaMalloc((void**)&d_N, matrixSizeN);
+
+  cudaMemcpy(d_M, h_M, matrixSizeM, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_N, h_N, matrixSizeN, cudaMemcpyHostToDevice);
+
+  dim3 blockDim(TILE_SIZE, TILE_SIZE);
+  dim3 gridDim((WidthN + TILE_SIZE - 1) / TILE_SIZE, (HeightM + TILE_SIZE - 1) / TILE_SIZE);
+
+  matrixSizeP = HeightM * WidthN * sizeof(float);
+  h_P = (float*)malloc(matrixSizeP);
+  cudaMalloc((void**)&d_P, matrixSizeP);
+
+  cudaEvent_t start, stop;
+
+  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::: Data Transfer to Device
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start);
+  cudaMemcpy(d_M, h_M, matrixSizeM, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_N, h_N, matrixSizeN, cudaMemcpyHostToDevice);
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float transferToDeviceTime = 0;
+  cudaEventElapsedTime(&transferToDeviceTime, start, stop);
+  printf("Data Transfer Time: %.4f seconds\n", transferToDeviceTime / 1000.0);
+
+  //:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::: Kernel Execution
+  cudaEventRecord(start);
+  MatrixMulTiledKernel<<<gridDim, blockDim>>>(d_M, d_N, d_P, WidthM, HeightM, WidthN, HeightN);
+  cudaDeviceSynchronize();
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float kernelExecutionTime = 0;
+  cudaEventElapsedTime(&kernelExecutionTime, start, stop);
+  printf("Kernel Execution Time: %.4f seconds\n", kernelExecutionTime / 1000.0);
+
+  //:::::::::::::::::::::::::::::::::::::::::::::::::::::: Data Transfer Back to Host
+  cudaEventRecord(start);
+  cudaMemcpy(h_P, d_P, matrixSizeP, cudaMemcpyDeviceToHost);
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float transferToHostTime = 0;
+  cudaEventElapsedTime(&transferToHostTime, start, stop);
+  printf("Data Transfer Back Time: %.4f seconds\n", transferToHostTime / 1000.0);
+
+  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::: Total Time
+  float totalTime = (transferToDeviceTime + kernelExecutionTime + transferToHostTime) / 1000.0;
+  printf("Total Time: %.4f seconds\n", totalTime);
+
+  free(h_M);
+  free(h_N);
+  free(h_P);
+
+  cudaFree(d_M);
+  cudaFree(d_N);
+  cudaFree(d_P);
+
+  return 0;
+}
